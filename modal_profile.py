@@ -33,7 +33,7 @@ volume = modal.Volume.from_name("snac-optimized", create_if_missing=True)
 
 
 @app.function(
-    gpu=modal.gpu.H100(),
+    gpu="H100",
     image=image,
     volumes={"/cache": volume},
     timeout=1800,
@@ -214,7 +214,7 @@ def profile_snac(
 
 
 @app.function(
-    gpu=modal.gpu.H100(),
+    gpu="H100",
     image=image,
     volumes={"/cache": volume},
     timeout=1800,
@@ -284,7 +284,7 @@ def profile_pytorch_profiler(
 
 
 @app.function(
-    gpu=modal.gpu.H100(),
+    gpu="H100",
     image=image,
     volumes={"/cache": volume},
     timeout=1800,
@@ -374,6 +374,290 @@ def benchmark_sweep(
     return results
 
 
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={"/cache": volume},
+    timeout=1800,
+)
+def profile_memory_allocations(
+    model_id: str = "hubertsiuzdak/snac_24khz",
+    audio_durations: list = [1.0, 5.0, 10.0, 30.0],
+):
+    """
+    Profile memory allocation patterns across different audio lengths.
+
+    Uses PyTorch CUDA memory snapshot to capture:
+    - Number of allocations per decode
+    - Allocation sizes and patterns
+    - Memory scaling with audio length
+
+    Saves snapshots to /cache for download and visualization at pytorch.org/memory_viz
+    """
+    import torch
+    from snac import SNAC
+    import os
+    import math
+    import pickle
+
+    os.environ["HF_HOME"] = "/cache/huggingface"
+
+    print(f"=== Memory Allocation Profiler ===")
+    print(f"PyTorch: {torch.__version__}")
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print()
+
+    model = SNAC.from_pretrained(model_id).cuda().eval()
+
+    def generate_codes(batch_size, audio_seconds):
+        samples = int(audio_seconds * model.sampling_rate)
+        hop = model.hop_length
+        attn_window = model.attn_window_size or 1
+        lcm = math.lcm(model.vq_strides[0], attn_window)
+        pad_to = hop * lcm
+        padded_samples = math.ceil(samples / pad_to) * pad_to
+        latent_len = padded_samples // hop
+
+        codes = []
+        for stride in model.vq_strides:
+            code_len = latent_len // stride
+            code = torch.randint(0, model.codebook_size, (batch_size, code_len), device="cuda")
+            codes.append(code)
+        return codes
+
+    results = []
+    snapshot_paths = []
+
+    for duration in audio_durations:
+        print(f"\n--- Profiling {duration}s audio ---")
+        codes = generate_codes(1, duration)
+
+        # Warmup (without recording)
+        for _ in range(10):
+            with torch.no_grad():
+                _ = model.decode(codes)
+        torch.cuda.synchronize()
+
+        # Clear memory stats
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+
+        # Start recording memory history
+        # max_entries limits buffer size to avoid excessive memory use
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+
+        # Run a single decode to capture allocation pattern
+        with torch.no_grad():
+            _ = model.decode(codes)
+        torch.cuda.synchronize()
+
+        # Capture snapshot
+        snapshot_path = f"/cache/memory_snapshot_{duration}s.pickle"
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        snapshot_paths.append(snapshot_path)
+
+        # Stop recording
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+        # Get memory stats
+        peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+        # Load and analyze snapshot
+        with open(snapshot_path, 'rb') as f:
+            snapshot = pickle.load(f)
+
+        # Count allocation events
+        alloc_count = 0
+        free_count = 0
+        total_allocated = 0
+
+        if 'device_traces' in snapshot:
+            for trace in snapshot.get('device_traces', []):
+                for event in trace:
+                    if event.get('action') == 'alloc':
+                        alloc_count += 1
+                        total_allocated += event.get('size', 0)
+                    elif event.get('action') == 'free':
+                        free_count += 1
+
+        result = {
+            "audio_seconds": duration,
+            "peak_memory_mb": peak_memory,
+            "allocation_count": alloc_count,
+            "free_count": free_count,
+            "total_allocated_mb": total_allocated / 1024 / 1024,
+            "snapshot_path": snapshot_path,
+        }
+        results.append(result)
+
+        print(f"  Peak memory: {peak_memory:.1f} MB")
+        print(f"  Allocations: {alloc_count}, Frees: {free_count}")
+        print(f"  Snapshot saved: {snapshot_path}")
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("MEMORY ALLOCATION SUMMARY")
+    print("=" * 70)
+    print(f"{'Duration':<12} {'Peak(MB)':<12} {'Allocs':<12} {'Frees':<12} {'Alloc/Free':<12}")
+    print("-" * 70)
+
+    for r in results:
+        ratio = r['allocation_count'] / max(r['free_count'], 1)
+        print(f"{r['audio_seconds']:<12.1f} {r['peak_memory_mb']:<12.1f} {r['allocation_count']:<12} {r['free_count']:<12} {ratio:<12.2f}")
+
+    # Check scaling
+    if len(results) >= 2:
+        mem_ratio = results[-1]['peak_memory_mb'] / results[0]['peak_memory_mb']
+        time_ratio = results[-1]['audio_seconds'] / results[0]['audio_seconds']
+        print(f"\nMemory scaling: {results[0]['audio_seconds']}s → {results[-1]['audio_seconds']}s")
+        print(f"  Time ratio: {time_ratio:.1f}x")
+        print(f"  Memory ratio: {mem_ratio:.1f}x")
+        print(f"  Scaling: {'~linear' if 0.8 < mem_ratio/time_ratio < 1.2 else 'non-linear'}")
+
+    print("\n" + "=" * 70)
+    print("SNAPSHOT FILES (download and view at pytorch.org/memory_viz):")
+    for path in snapshot_paths:
+        print(f"  {path}")
+    print("=" * 70)
+
+    return results
+
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={"/cache": volume},
+    timeout=1800,
+)
+def profile_allocation_hotspots(
+    model_id: str = "hubertsiuzdak/snac_24khz",
+    audio_seconds: float = 5.0,
+):
+    """
+    Identify allocation hotspots by analyzing stack traces.
+
+    Shows which operations allocate the most memory during decode.
+    """
+    import torch
+    from snac import SNAC
+    import os
+    import math
+    import pickle
+    from collections import defaultdict
+
+    os.environ["HF_HOME"] = "/cache/huggingface"
+
+    print(f"=== Allocation Hotspot Analysis ===")
+    model = SNAC.from_pretrained(model_id).cuda().eval()
+
+    def generate_codes(batch_size, audio_seconds):
+        samples = int(audio_seconds * model.sampling_rate)
+        hop = model.hop_length
+        attn_window = model.attn_window_size or 1
+        lcm = math.lcm(model.vq_strides[0], attn_window)
+        pad_to = hop * lcm
+        padded_samples = math.ceil(samples / pad_to) * pad_to
+        latent_len = padded_samples // hop
+
+        codes = []
+        for stride in model.vq_strides:
+            code_len = latent_len // stride
+            code = torch.randint(0, model.codebook_size, (batch_size, code_len), device="cuda")
+            codes.append(code)
+        return codes
+
+    codes = generate_codes(1, audio_seconds)
+
+    # Warmup
+    for _ in range(10):
+        with torch.no_grad():
+            _ = model.decode(codes)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    # Record with stack traces
+    torch.cuda.memory._record_memory_history(
+        max_entries=100000,
+        stacks="python",  # Capture Python stack traces
+    )
+
+    with torch.no_grad():
+        _ = model.decode(codes)
+    torch.cuda.synchronize()
+
+    snapshot_path = "/cache/memory_hotspots.pickle"
+    torch.cuda.memory._dump_snapshot(snapshot_path)
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+    # Analyze stack traces
+    with open(snapshot_path, 'rb') as f:
+        snapshot = pickle.load(f)
+
+    # Aggregate by stack trace
+    alloc_by_stack = defaultdict(lambda: {"count": 0, "total_bytes": 0})
+
+    if 'device_traces' in snapshot:
+        for trace in snapshot.get('device_traces', []):
+            for event in trace:
+                if event.get('action') == 'alloc':
+                    # Get stack trace (simplified)
+                    frames = event.get('frames', [])
+                    if frames:
+                        # Use top frame as key
+                        top_frame = frames[0] if frames else {}
+                        key = f"{top_frame.get('filename', 'unknown')}:{top_frame.get('line', 0)}"
+                    else:
+                        key = "unknown"
+
+                    alloc_by_stack[key]["count"] += 1
+                    alloc_by_stack[key]["total_bytes"] += event.get('size', 0)
+
+    # Sort by total bytes
+    sorted_allocs = sorted(
+        alloc_by_stack.items(),
+        key=lambda x: x[1]["total_bytes"],
+        reverse=True
+    )
+
+    print(f"\nTop allocation sites for {audio_seconds}s audio:")
+    print("-" * 80)
+    print(f"{'Location':<50} {'Count':<10} {'Total (MB)':<15}")
+    print("-" * 80)
+
+    for loc, stats in sorted_allocs[:20]:
+        mb = stats["total_bytes"] / 1024 / 1024
+        print(f"{loc:<50} {stats['count']:<10} {mb:<15.2f}")
+
+    print(f"\nFull snapshot saved to: {snapshot_path}")
+    print("Visualize at: pytorch.org/memory_viz")
+
+    return {
+        "snapshot_path": snapshot_path,
+        "top_allocations": sorted_allocs[:20],
+    }
+
+
+@app.function(
+    volumes={"/cache": volume},
+)
+def download_snapshots():
+    """
+    List and return paths to memory snapshots for download.
+    """
+    import os
+
+    snapshot_dir = "/cache"
+    snapshots = []
+
+    for f in os.listdir(snapshot_dir):
+        if f.endswith(".pickle") and "memory" in f:
+            path = os.path.join(snapshot_dir, f)
+            size_mb = os.path.getsize(path) / 1024 / 1024
+            snapshots.append({"path": path, "size_mb": size_mb})
+
+    return snapshots
+
+
 @app.local_entrypoint()
 def main(
     mode: str = "profile",
@@ -384,7 +668,12 @@ def main(
     Local entrypoint for running profiling.
 
     Args:
-        mode: "profile" for detailed profiling, "pytorch" for kernel analysis, "sweep" for benchmark sweep
+        mode: Profiling mode
+            - "profile": Detailed timing breakdown
+            - "pytorch": Kernel-level analysis with PyTorch profiler
+            - "sweep": Benchmark across audio durations
+            - "memory": Memory allocation patterns across durations
+            - "hotspots": Identify allocation hotspots with stack traces
         batch_size: Batch size for inference
         audio_seconds: Audio duration in seconds
     """
@@ -408,6 +697,25 @@ def main(
         for r in results:
             print(r)
 
+    elif mode == "memory":
+        results = profile_memory_allocations.remote(
+            audio_durations=[1.0, 5.0, 10.0, 30.0],
+        )
+        print("\nMemory profiling complete.")
+        print("Snapshots saved to /cache - download and visualize at pytorch.org/memory_viz")
+
+    elif mode == "hotspots":
+        results = profile_allocation_hotspots.remote(
+            audio_seconds=audio_seconds,
+        )
+        print("\nHotspot analysis complete.")
+        print(f"Snapshot: {results['snapshot_path']}")
+
     else:
         print(f"Unknown mode: {mode}")
-        print("Use: profile, pytorch, or sweep")
+        print("Available modes:")
+        print("  profile   - Detailed timing breakdown (vq_from_codes vs decoder)")
+        print("  pytorch   - Kernel-level analysis with PyTorch profiler")
+        print("  sweep     - Benchmark across audio durations (1s, 5s, 10s, 30s)")
+        print("  memory    - Memory allocation patterns across durations")
+        print("  hotspots  - Identify allocation hotspots with stack traces")
