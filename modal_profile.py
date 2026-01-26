@@ -407,9 +407,11 @@ def profile_memory_allocations(
     print(f"GPU: {torch.cuda.get_device_name()}")
     print()
 
+    audio_durations.extend([30]*100) # hardcoded test for 100 times of audio testing for decode
     model = SNAC.from_pretrained(model_id).cuda().eval()
 
     def generate_codes(batch_size, audio_seconds):
+
         samples = int(audio_seconds * model.sampling_rate)
         hop = model.hop_length
         attn_window = model.attn_window_size or 1
@@ -428,23 +430,23 @@ def profile_memory_allocations(
     results = []
     snapshot_paths = []
 
+    # Warmup (without recording)
+    for _ in range(10):
+        with torch.no_grad():
+            _ = model.decode(codes)
+    torch.cuda.synchronize()
+
     for duration in audio_durations:
         print(f"\n--- Profiling {duration}s audio ---")
         codes = generate_codes(1, duration)
 
-        # Warmup (without recording)
-        for _ in range(10):
-            with torch.no_grad():
-                _ = model.decode(codes)
-        torch.cuda.synchronize()
-
         # Clear memory stats
         torch.cuda.reset_peak_memory_stats()
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache() # don't empty cache, test under load for peak allocations / predictable behavior
 
         # Start recording memory history
         # max_entries limits buffer size to avoid excessive memory use
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        torch.cuda.memory._record_memory_history() # dont use max_entries=100000 for now
 
         # Run a single decode to capture allocation pattern
         with torch.no_grad():
